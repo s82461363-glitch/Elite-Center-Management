@@ -623,16 +623,20 @@
     <!-- الملفات -->
     <div id="view-files" class="section-view">
       <div class="card">
-        <h2>📁 رفع ملف PDF أو صورة</h2>
+        <h2>📁 إضافة ملف PDF أو صورة</h2>
         <div class="input-group">
           <label>عنوان الملف</label>
           <input type="text" id="file-title" placeholder="مثال: مذكرة المحاضرة الأولى" />
         </div>
         <div class="input-group">
-          <label>اختر الملف (PDF أو صورة - حد أقصى 20 ميجا)</label>
+          <label>اختر الملف (PDF حتى 700 كيلوبايت، والصور بتتضغط تلقائيًا)</label>
           <input type="file" id="file-input" accept=".pdf,image/*" />
         </div>
-        <button class="btn btn-primary" id="upload-file-btn">⬆ رفع الملف</button>
+        <div class="input-group">
+          <label>أو الصق رابط خارجي للملفات الكبيرة (اختياري — من Google Drive مثلًا، وتأكد إن مشاركة الرابط "أي شخص لديه الرابط")</label>
+          <input type="url" id="file-link" placeholder="https://..." />
+        </div>
+        <button class="btn btn-primary" id="upload-file-btn">⬆ إضافة الملف</button>
         <p id="upload-status" style="font-size:0.85rem; color:var(--text-muted); margin-top:10px;"></p>
       </div>
       <div class="card">
@@ -650,7 +654,7 @@
           <textarea id="post-text" rows="3" placeholder="اكتب البوست هنا..."></textarea>
         </div>
         <div class="input-group">
-          <label>صورة (اختياري - حد أقصى 10 ميجا)</label>
+          <label>صورة (اختياري — بتتضغط تلقائيًا)</label>
           <input type="file" id="post-image" accept="image/*" />
         </div>
         <button class="btn btn-primary" id="publish-post-btn">🚀 نشر البوست</button>
@@ -752,9 +756,6 @@
     import {
       getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut
     } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-auth.js";
-    import {
-      getStorage, ref, uploadBytes, getDownloadURL, deleteObject
-    } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-storage.js";
 
     const firebaseConfig = {
       apiKey: "AIzaSyDL0vDRFlULt6Q9A8j4HA4rj5o-yi2q5Mg",
@@ -768,7 +769,44 @@
     const app = initializeApp(firebaseConfig);
     const db = getFirestore(app);
     const auth = getAuth(app);
-    const storage = getStorage(app);
+
+    // تخزين مجاني بدون Blaze: الملفات والصور بتتحفظ داخل Firestore نفسه كـ base64.
+    // حد Firestore للدوكيومنت 1 ميجا، فبنخلي الحد الأقصى للبيانات المشفرة 1,000,000 حرف.
+    const MAX_DATA_CHARS = 1000000;
+
+    function fileToDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(r.result);
+        r.onerror = () => reject(new Error("تعذر قراءة الملف"));
+        r.readAsDataURL(file);
+      });
+    }
+
+    // ضغط الصور على جهاز الأدمن قبل الحفظ عشان تفضل تحت حد الميجا
+    async function compressImageToDataUrl(file) {
+      const srcUrl = await fileToDataUrl(file);
+      const img = await new Promise((resolve, reject) => {
+        const i = new Image();
+        i.onload = () => resolve(i);
+        i.onerror = () => reject(new Error("تعذر فتح الصورة"));
+        i.src = srcUrl;
+      });
+      let w = img.width, h = img.height;
+      const MAX_DIM = 1600;
+      if (Math.max(w, h) > MAX_DIM) {
+        const k = MAX_DIM / Math.max(w, h);
+        w = Math.round(w * k); h = Math.round(h * k);
+      }
+      for (const q of [0.85, 0.7, 0.55, 0.4]) {
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0, w, h);
+        const out = c.toDataURL('image/jpeg', q);
+        if (out.length <= MAX_DATA_CHARS) return out;
+      }
+      throw new Error("الصورة كبيرة جداً حتى بعد الضغط، جرب صورة أصغر");
+    }
 
     let currentScannedUid = "";
     let html5QrCode = null;
@@ -1445,37 +1483,50 @@
     document.getElementById('upload-file-btn').addEventListener('click', async () => {
       const title = document.getElementById('file-title').value.trim();
       const file = document.getElementById('file-input').files[0];
+      const link = document.getElementById('file-link').value.trim();
       if (!title) return alert("اكتب عنوان الملف");
-      if (!file) return alert("اختر ملف PDF أو صورة");
-      const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
-      if (!isPdf && !file.type.startsWith('image/')) return alert("الملف لازم يكون PDF أو صورة");
-      if (file.size > 20 * 1024 * 1024) return alert("حجم الملف أكبر من 20 ميجا");
+      if (!file && !link) return alert("اختر ملف أو الصق رابط خارجي");
+      if (file && link) return alert("اختار حاجة واحدة: ملف أو رابط، مش الاتنين");
       const btn = document.getElementById('upload-file-btn');
       const status = document.getElementById('upload-status');
       btn.disabled = true;
-      btn.textContent = "جاري الرفع...";
+      btn.textContent = "جاري الإضافة...";
       try {
-        const path = `uploads/${Date.now()}_${file.name}`;
-        const sRef = ref(storage, path);
-        await uploadBytes(sRef, file);
-        const url = await getDownloadURL(sRef);
-        await addDoc(collection(db, "files"), {
-          title, name: file.name, type: isPdf ? 'pdf' : 'image',
-          url, path, size: file.size, time: serverTimestamp()
-        });
+        let docData, data = null;
+        if (link) {
+          if (!/^https?:\/\//i.test(link)) throw new Error("الرابط لازم يبدأ بـ http أو https");
+          docData = { title, type: 'link', url: link, time: serverTimestamp() };
+        } else {
+          const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+          if (!isPdf && !file.type.startsWith('image/')) return alert("الملف لازم يكون PDF أو صورة");
+          if (isPdf) {
+            data = await fileToDataUrl(file);
+            if (data.length > MAX_DATA_CHARS)
+              throw new Error("ملف الـ PDF أكبر من 700 كيلوبايت تقريبًا. ارفعه على Google Drive والصق رابطه في خانة الرابط بدلًا منه.");
+            docData = { title, name: file.name, type: 'pdf', size: file.size, time: serverTimestamp() };
+          } else {
+            data = await compressImageToDataUrl(file);
+            docData = { title, name: file.name.replace(/\.[^.]+$/, '') + '.jpg', type: 'image', time: serverTimestamp() };
+          }
+        }
+        // المحتوى بيتخزن في دوكيومنت منفصل (subcollection) عشان قايمة الملفات
+        // ما تحمّلش كل الملفات على موبايل الطالب
+        const added = await addDoc(collection(db, "files"), docData);
+        if (data) await setDoc(doc(db, "files", added.id, "blob", "content"), { data });
         await addDoc(collection(db, "notifications"), {
           text: `📁 ملف جديد متاح الآن: ${title}`, time: serverTimestamp()
         });
-        status.textContent = "✅ تم رفع الملف وإشعار الطلاب";
+        status.textContent = "✅ تمت إضافة الملف وإشعار الطلاب";
         document.getElementById('file-title').value = "";
         document.getElementById('file-input').value = "";
+        document.getElementById('file-link').value = "";
         loadFiles();
       } catch (err) {
         console.error(err);
-        status.textContent = "❌ فشل الرفع: " + err.message;
+        status.textContent = "❌ فشل: " + err.message;
       } finally {
         btn.disabled = false;
-        btn.textContent = "⬆ رفع الملف";
+        btn.textContent = "⬆ إضافة الملف";
       }
     });
 
@@ -1491,17 +1542,22 @@
         container.innerHTML = "";
         snap.forEach(d => {
           const f = d.data();
-          const icon = f.type === 'image' ? '🖼️' : '📄';
+          const icon = f.type === 'image' ? '🖼️' : (f.type === 'link' ? '🔗' : '📄');
           const t = f.time?.toDate ? f.time.toDate().toLocaleString("ar-EG") : "";
+          const openAttr = f.type === 'link'
+            ? `href="${f.url}" target="_blank" rel="noopener"`
+            : `href="javascript:void(0)" onclick="openStoredFile('${d.id}')"`;
+          window._filesData = window._filesData || {};
+          window._filesData[d.id] = { name: f.name || 'file', legacyData: f.data || null };
           container.innerHTML += `
             <div class="item-card">
               <div class="item-info">
                 <h4>${icon} ${f.title || f.name || "ملف"}</h4>
-                <p>${f.name || ""} • ${t}</p>
+                <p>${f.name || f.url || ""} • ${t}</p>
               </div>
               <div class="item-actions">
-                <a class="btn-sm btn-copy" href="${f.url}" target="_blank" rel="noopener" style="text-decoration:none;">فتح</a>
-                <button class="btn-sm btn-delete" onclick="deleteFile('${d.id}', '${(f.path || '').replace(/'/g, "\'")}')">حذف</button>
+                <a class="btn-sm btn-copy" ${openAttr} style="text-decoration:none;">فتح</a>
+                <button class="btn-sm btn-delete" onclick="deleteFile('${d.id}')">حذف</button>
               </div>
             </div>`;
         });
@@ -1510,11 +1566,31 @@
       }
     }
 
-    window.deleteFile = function(id, path) {
+    window.openStoredFile = async function(id) {
+      const meta = (window._filesData || {})[id] || {};
+      try {
+        let data = meta.legacyData;
+        if (!data) {
+          const blobSnap = await getDoc(doc(db, "files", id, "blob", "content"));
+          data = blobSnap.exists() ? blobSnap.data().data : null;
+        }
+        if (!data) return alert("الملف غير موجود");
+        const a = document.createElement('a');
+        a.href = data;
+        a.download = meta.name || 'file';
+        a.target = '_blank';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } catch (e) { alert("تعذر فتح الملف"); }
+    };
+
+    window.deleteFile = function(id) {
       showConfirm("حذف الملف", "سيتم حذف الملف نهائياً من المنصة. متابعة؟", async () => {
         try {
-          if (path) { try { await deleteObject(ref(storage, path)); } catch (e) {} }
+          try { await deleteDoc(doc(db, "files", id, "blob", "content")); } catch (e) {}
           await deleteDoc(doc(db, "files", id));
+          if (window._filesData) delete window._filesData[id];
           loadFiles();
         } catch (e) { alert("فشل الحذف"); }
       });
@@ -1529,15 +1605,11 @@
       btn.disabled = true;
       btn.textContent = "جاري النشر...";
       try {
-        let imageUrl = "", imagePath = "";
+        let imageUrl = "";
         if (imgFile) {
-          if (imgFile.size > 10 * 1024 * 1024) throw new Error("حجم الصورة أكبر من 10 ميجا");
-          imagePath = `uploads/${Date.now()}_${imgFile.name}`;
-          const sRef = ref(storage, imagePath);
-          await uploadBytes(sRef, imgFile);
-          imageUrl = await getDownloadURL(sRef);
+          imageUrl = await compressImageToDataUrl(imgFile);
         }
-        await addDoc(collection(db, "posts"), { text, imageUrl, imagePath, time: serverTimestamp() });
+        await addDoc(collection(db, "posts"), { text, imageUrl, time: serverTimestamp() });
         await addDoc(collection(db, "notifications"), { text: "📰 بوست جديد من إدارة إيليت", time: serverTimestamp() });
         document.getElementById('post-text').value = "";
         document.getElementById('post-image').value = "";
@@ -1572,7 +1644,7 @@
                 <p style="margin-top:6px;">${t}</p>
               </div>
               <div class="item-actions">
-                <button class="btn-sm btn-delete" onclick="deletePost('${d.id}', '${(p.imagePath || '').replace(/'/g, "\'")}')">حذف</button>
+                <button class="btn-sm btn-delete" onclick="deletePost('${d.id}')">حذف</button>
               </div>
             </div>`;
         });
@@ -1581,10 +1653,9 @@
       }
     }
 
-    window.deletePost = function(id, imagePath) {
+    window.deletePost = function(id) {
       showConfirm("حذف البوست", "هل تريد حذف هذا البوست؟", async () => {
         try {
-          if (imagePath) { try { await deleteObject(ref(storage, imagePath)); } catch (e) {} }
           await deleteDoc(doc(db, "posts", id));
           loadPosts();
         } catch (e) { alert("فشل الحذف"); }
